@@ -142,6 +142,26 @@ async function handleRequest(request) {
     }
   }
 
+  // ── Silent token refresh (uses stored refresh token) ────
+  if (url.pathname === '/auth/refresh' && request.method === 'GET') {
+    const provider = url.searchParams.get('provider') || 'google';
+    try {
+      if (provider === 'dropbox') {
+        const refreshToken = await KV.get('dropbox_refresh_token');
+        if (!refreshToken) return json({ error: 'No refresh token stored' }, corsHeaders, 404);
+        const token = await getDropboxAccessToken(refreshToken);
+        return json({ access_token: token }, corsHeaders);
+      } else {
+        const refreshToken = await KV.get('drive_refresh_token');
+        if (!refreshToken) return json({ error: 'No refresh token stored' }, corsHeaders, 404);
+        const token = await getGoogleAccessToken(refreshToken);
+        return json({ access_token: token }, corsHeaders);
+      }
+    } catch (err) {
+      return json({ error: err.message }, corsHeaders, 401);
+    }
+  }
+
   // ── Retrieve temp Google access token ───────────────────
   if (url.pathname === '/auth/token' && request.method === 'GET') {
     const token = await KV.get('drive_access_token_temp');
