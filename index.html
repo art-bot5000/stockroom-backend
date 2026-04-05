@@ -2095,6 +2095,7 @@ async function saveData() {
   if (!Array.isArray(items)) { console.error('stockroom: items is not an array, aborting save'); return; }
   await dbPut('items', 'items', items);
   if (activeProfile) await saveCurrentProfile();
+  registerBackgroundSync(); // queue a background sync in case we're offline
 }
 
 async function saveSettings() {
@@ -2116,11 +2117,99 @@ async function _saveSettings() {
 }
 
 // Stamp updatedAt on an item whenever it's modified
-function touchItem(item) {
-  item.updatedAt = new Date().toISOString();
+// ── Field-level timestamps (lightweight CRDT) ────────────
+// touchField stamps individual fields in item._fieldTs so mergeItems
+// can resolve conflicts at field granularity rather than whole-item LWW.
+// Fields with no _fieldTs entry fall back to item-level updatedAt.
+function touchField(item, ...fields) {
+  const now = new Date().toISOString();
+  item.updatedAt = now;
+  if (!item._fieldTs) item._fieldTs = {};
+  if (fields.length === 0) {
+    // No specific fields — stamp the whole item (backwards compat for touchItem callers)
+    return;
+  }
+  fields.forEach(f => { item._fieldTs[f] = now; });
 }
 
-// ── Deletion tombstones ───────────────────────────────────
+// Keep touchItem as an alias for callers that set multiple fields at once
+function touchItem(item) { touchField(item); }
+
+// ── Logs union merge ─────────────────────────────────────
+// Logs are append-only — merge by ID union, never discard an entry
+function mergeLogs(localLogs = [], remoteLogs = []) {
+  const byId = new Map();
+  // Remote first so local can overwrite (local edits to existing logs win)
+  for (const l of remoteLogs) byId.set(l.id, l);
+  for (const l of localLogs)  byId.set(l.id, l);
+  return Array.from(byId.values()).sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+// ── Field-level item merge ───────────────────────────────
+function mergeItemFields(local, remote) {
+  // Start with a shallow copy of local
+  const result = { ...local };
+
+  // Fields we track individually — everything except id, updatedAt, _fieldTs, logs
+  const SCALAR_FIELDS = [
+    'name','category','cadence','qty','months','url','store','notes',
+    'startedUsing','rating','imageUrl','storePrices','expiry',
+    'thresholdOverride','replacementInterval','replacementUnit',
+    'lastReplaced','ordered','orderedAt','quickAdded','tags',
+    'subscribeAndSave','stockCount','stockCountDate',
+  ];
+
+  const localTs  = local._fieldTs  || {};
+  const remoteTs = remote._fieldTs || {};
+  const itemLocalTime  = local.updatedAt  ? new Date(local.updatedAt).getTime()  : 0;
+  const itemRemoteTime = remote.updatedAt ? new Date(remote.updatedAt).getTime() : 0;
+
+  for (const field of SCALAR_FIELDS) {
+    if (!(field in remote)) continue; // remote doesn't have this field — keep local
+    const lt = localTs[field]  ? new Date(localTs[field]).getTime()  : itemLocalTime;
+    const rt = remoteTs[field] ? new Date(remoteTs[field]).getTime() : itemRemoteTime;
+    if (rt > lt) result[field] = remote[field];
+  }
+
+  // Logs: union merge by ID
+  result.logs = mergeLogs(local.logs, remote.logs);
+
+  // Merge _fieldTs — keep the newest timestamp per field
+  result._fieldTs = { ...remoteTs, ...localTs };
+  for (const f of Object.keys(remoteTs)) {
+    if (!localTs[f] || new Date(remoteTs[f]) > new Date(localTs[f])) {
+      result._fieldTs[f] = remoteTs[f];
+    }
+  }
+
+  // updatedAt = newest of the two
+  result.updatedAt = itemLocalTime >= itemRemoteTime ? local.updatedAt : remote.updatedAt;
+
+  return result;
+}
+
+async function mergeItems(local, remote, remoteWins = false) {
+  const deletedIds = await loadDeletedIds();
+  const merged = new Map();
+
+  for (const item of local) {
+    if (!deletedIds.has(item.id)) merged.set(item.id, item);
+  }
+
+  for (const remoteItem of remote) {
+    if (deletedIds.has(remoteItem.id)) continue;
+    const localItem = merged.get(remoteItem.id);
+    if (!localItem) {
+      // Item only in remote — add it
+      merged.set(remoteItem.id, remoteItem);
+    } else {
+      // Item in both — field-level merge
+      merged.set(remoteItem.id, mergeItemFields(localItem, remoteItem));
+    }
+  }
+
+  return Array.from(merged.values());
+}
 async function loadDeletedIds() {
   const stored = await dbGet('deletedIds', 'deletedIds');
   if (stored) return new Set(stored);
@@ -4273,14 +4362,14 @@ async function confirmLogReplacement() {
 
   if (itemId) {
     const item = items.find(i => i.id === itemId);
-    if (item) { item.lastReplaced = date; touchItem(item); saveData(); }
+    if (item) { item.lastReplaced = date; touchField(item, 'lastReplaced'); saveData(); }
   } else {
     const r = reminders.find(r => r.id === id);
     if (r) { r.lastReplaced = date; saveReminders(); }
     // Also update linked item
     if (r?.linkedItemId) {
       const item = items.find(i => i.id === r.linkedItemId);
-      if (item) { item.lastReplaced = date; touchItem(item); saveData(); }
+      if (item) { item.lastReplaced = date; touchField(item, 'lastReplaced'); saveData(); }
     }
   }
 
@@ -4310,7 +4399,7 @@ async function _applyReplacedLocally(reminderId, date) {
   if (reminderId.startsWith('item_')) {
     const itemId = reminderId.replace('item_', '');
     const item   = items.find(i => i.id === itemId);
-    if (item) { item.lastReplaced = date; touchItem(item); saveData(); changed = true; }
+    if (item) { item.lastReplaced = date; touchField(item, 'lastReplaced'); saveData(); changed = true; }
   } else {
     const r = reminders.find(r => r.id === reminderId);
     if (r) {
@@ -4319,7 +4408,7 @@ async function _applyReplacedLocally(reminderId, date) {
       changed = true;
       if (r.linkedItemId) {
         const item = items.find(i => i.id === r.linkedItemId);
-        if (item) { item.lastReplaced = date; touchItem(item); saveData(); }
+        if (item) { item.lastReplaced = date; touchField(item, 'lastReplaced'); saveData(); }
       }
     }
   }
@@ -4429,7 +4518,7 @@ async function markOrdered(id) {
   if (!item) return;
   item.ordered   = true;
   item.orderedAt = new Date().toISOString();
-  touchItem(item);
+  touchField(item, 'ordered','orderedAt');
   await saveData();
   renderAll();
   setTimeout(syncAll, 400);
@@ -4441,7 +4530,7 @@ async function unmarkOrdered(id) {
   if (!item) return;
   item.ordered   = false;
   item.orderedAt = null;
-  touchItem(item);
+  touchField(item, 'ordered','orderedAt');
   await saveData();
   renderAll();
   setTimeout(syncAll, 400);
@@ -5257,10 +5346,42 @@ document.addEventListener('visibilitychange', () => {
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', event => {
     if (event.data?.type === 'REMINDER_REPLACED') {
-      const { reminderId, date, token } = event.data;
+      const { reminderId, date } = event.data;
       _applyReplacedLocally(reminderId, date);
     }
+    if (event.data?.type === 'BG_SYNC') {
+      // Background sync fired while app was open — run sync now
+      console.log('BG_SYNC received from SW');
+      syncAll().catch(e => console.warn('BG_SYNC syncAll failed:', e));
+    }
   });
+}
+
+// ── Register background sync after every save ─────────────
+// The browser will fire the 'sync' event in the SW when connectivity
+// returns, even if this tab is closed.
+async function registerBackgroundSync() {
+  if (!('serviceWorker' in navigator) || !('SyncManager' in window)) return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    await reg.sync.register('stockroom-sync');
+  } catch(e) {
+    // Background Sync not supported or permission denied — silent fallback
+  }
+}
+
+// ── Check for pending sync flag set by SW while app was closed ─
+async function checkPendingSWSync() {
+  if (!('caches' in window)) return;
+  try {
+    const cache   = await caches.open('stockroom-flags');
+    const pending = await cache.match('pending-sync');
+    if (pending) {
+      await cache.delete('pending-sync');
+      console.log('Pending SW sync flag found — syncing now');
+      setTimeout(syncAll, 800);
+    }
+  } catch(e) {}
 }
 
 // Poll every 5 minutes as a backstop
@@ -7416,7 +7537,11 @@ async function saveItem() {
           item.logs = [{ id: uid(), date: lastDate, qty: lastQty, price: lastPrice, store: storeVal }];
         }
       }
-      touchItem(item);
+      touchField(item,
+        'name','category','cadence','qty','months','url','store',
+        'notes','startedUsing','rating','imageUrl','storePrices',
+        'expiry','thresholdOverride','replacementInterval','replacementUnit'
+      );
     }
   } else {
     const lastDate  = document.getElementById('f-last-date').value;
@@ -7466,7 +7591,7 @@ async function saveLog() {
   // Mark as ordered
   item.ordered   = true;
   item.orderedAt = new Date().toISOString();
-  touchItem(item);
+  touchField(item, 'logs', 'ordered', 'orderedAt');
   await saveData();
   closeModal('log-modal');
   renderAll();
@@ -7633,7 +7758,7 @@ async function saveStartedUsing() {
   if (!item) return;
   const date = document.getElementById('started-using-date').value || today();
   item.startedUsing = date;
-  touchItem(item);
+  touchField(item, 'startedUsing');
   await saveData();
   closeModal('started-using-modal');
   renderAll();
@@ -9068,6 +9193,7 @@ async function init() {
   renderReminders(); // pre-render for badge count
 
   setTimeout(() => { lastAutoSync = Date.now(); checkCloudAhead(); }, 1500);
+  checkPendingSWSync();
   if (migrated) setTimeout(syncAll, 1500);
   setTimeout(checkScheduledEmail, 2000);
   setTimeout(checkLowStockNotifications, 3000);
