@@ -62,6 +62,35 @@ async function handleRequest(request) {
 
   const url = new URL(request.url);
 
+  // ── Debug: inspect current schedule state ───────────────
+  if (url.pathname === '/debug-schedule' && request.method === 'GET') {
+    const email       = await KV.get('user_email');
+    const scheduleRaw = await KV.get('schedule');
+    const lastSentAt  = await KV.get('last_sent');
+    const hasRefresh  = !!(await KV.get('drive_refresh_token'));
+    const hasDropbox  = !!(await KV.get('dropbox_refresh_token'));
+    const hasItems    = !!(await KV.get('user_items'));
+    const schedule    = scheduleRaw ? JSON.parse(scheduleRaw) : null;
+    const now         = new Date();
+    let nextSendUTC   = null;
+    if (schedule && !lastSentAt) {
+      nextSendUTC = `${schedule.startDate}T${schedule.startTime || '09:00'} UK time (check timezone)`;
+    } else if (schedule && lastSentAt) {
+      const next = new Date(new Date(lastSentAt).getTime() + schedule.intervalDays * 86400000);
+      nextSendUTC = next.toISOString();
+    }
+    return json({
+      now:            now.toISOString(),
+      email:          email ? '✓ set' : '✗ missing',
+      schedule:       schedule || '✗ missing',
+      lastSent:       lastSentAt || 'never',
+      nextSend:       nextSendUTC,
+      driveRefresh:   hasRefresh ? '✓ stored' : '✗ missing',
+      dropboxRefresh: hasDropbox ? '✓ stored' : '✗ missing',
+      kvSnapshot:     hasItems   ? '✓ stored' : '✗ missing',
+    }, corsHeaders);
+  }
+
   // ── Health check ────────────────────────────────────────
   if (url.pathname === '/ping') {
     return json({ ok: true }, corsHeaders);
@@ -220,7 +249,7 @@ async function handleRequest(request) {
   if (url.pathname === '/send-reminder' && request.method === 'POST') {
     try {
       const body = await request.json();
-      const { to, urgent = [], upcoming = [], items = [] } = body;
+      const { to, urgent = [], upcoming = [], items = [], manual = false } = body;
       const urgentItems   = urgent.length   ? urgent   : items.filter(i => i.daysLeft <= 7);
       const upcomingItems = upcoming.length ? upcoming : items.filter(i => i.daysLeft > 7);
       if (to) await KV.put('user_email', to);
@@ -228,7 +257,8 @@ async function handleRequest(request) {
         await KV.put('user_items', JSON.stringify({ urgent: urgentItems, upcoming: upcomingItems }));
       }
       const result = await sendEmail(to, urgentItems, upcomingItems);
-      if (result.ok) await KV.put('last_sent', new Date().toISOString());
+      // Only update last_sent for scheduled sends — manual "Send Now" must not shift the schedule
+      if (result.ok && !manual) await KV.put('last_sent', new Date().toISOString());
       return json(result.ok ? { ok: true } : { error: result.error }, corsHeaders, result.ok ? 200 : 502);
     } catch (err) {
       return json({ error: err.message }, corsHeaders, 500);
@@ -250,21 +280,23 @@ async function cronCheck() {
     const { startDate, startTime, intervalDays } = JSON.parse(scheduleRaw);
     const now      = new Date();
 
-    // Parse startDate+startTime as Europe/London time (handles GMT/BST automatically)
-    // We approximate by reading the UTC offset from a sample date in that timezone
+    // Parse startDate+startTime as Europe/London time
     function toUKDate(dateStr, timeStr) {
-      // Create a date string with an explicit timezone for UK
-      const candidate = new Date(`${dateStr}T${timeStr || '09:00'}:00`);
-      // Get the UTC offset for UK at that date (handles BST/GMT automatically)
-      const ukOffset = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', timeZoneName: 'shortOffset' })
-        .formatToParts(candidate)
-        .find(p => p.type === 'timeZoneName')?.value || 'GMT+0';
-      const offsetMatch = ukOffset.match(/([+-])(\d+):?(\d*)/);
-      const sign   = offsetMatch?.[1] === '-' ? -1 : 1;
-      const hours  = parseInt(offsetMatch?.[2] || '0');
-      const mins   = parseInt(offsetMatch?.[3] || '0');
-      const offsetMs = sign * (hours * 60 + mins) * 60000;
-      return new Date(candidate.getTime() - offsetMs);
+      // Build a temp date to measure the UK offset at that moment
+      const probe = new Date(`${dateStr}T${timeStr || '09:00'}:00Z`); // treat as UTC first
+      const ukParts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/London',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+      }).formatToParts(probe);
+      const get = (type) => parseInt(ukParts.find(p => p.type === type)?.value || '0');
+      const ukDate = new Date(Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')));
+      // Offset = difference between UTC representation and UK representation
+      const offsetMs = ukDate.getTime() - probe.getTime();
+      // Target: dateStr + timeStr in UK local time → UTC
+      const localMs = new Date(`${dateStr}T${timeStr || '09:00'}:00Z`).getTime();
+      return new Date(localMs - offsetMs);
     }
 
     const nextSend = !lastSentAt
@@ -404,13 +436,16 @@ function computeDaysLeft(itemsArr) {
   return itemsArr
     .filter(item => item.logs?.length)
     .map(item => {
-      const last      = item.logs[item.logs.length - 1];
+      // Only count delivered logs — same logic as the frontend calcStock()
+      const deliveredLogs = (item.logs || []).filter(l => !l.pendingDelivery);
+      if (!deliveredLogs.length) return null;
+      const last      = deliveredLogs[deliveredLogs.length - 1];
       const refDate   = item.startedUsing || last.date;
       const daysSince = (now - new Date(refDate + 'T12:00:00').getTime()) / 86400000;
       const totalDays = (item.months || 1) * 30.5 * (last.qty || 1);
       const daysLeft  = Math.round(Math.max(0, totalDays - daysSince));
       if (daysLeft > 30) return null;
-      const prices = (item.logs || [])
+      const prices = deliveredLogs
         .map(l => parseFloat(String(l.price || '').replace(/[^0-9.]/g, '')))
         .filter(v => !isNaN(v) && v > 0);
       return {
