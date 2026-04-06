@@ -333,20 +333,17 @@ async function handleRequest(request) {
   }
 
   // ── Household: owner creates an invite code ─────────────
-  // Stores the owner's driveFileId under a short invite code (6 chars, 24hr TTL).
-  // The partner pastes this code to join — no credentials are ever shared.
   if (url.pathname === '/invite/create' && request.method === 'POST') {
     try {
-      const body       = await request.json();
-      const { fileId } = body;
-      if (!fileId) return json({ error: 'Missing fileId' }, corsHeaders, 400);
-      // Verify owner has a refresh token stored
       const refreshToken = await KV.get('drive_refresh_token');
       if (!refreshToken) return json({ error: 'No Drive connection on server — sync first' }, corsHeaders, 400);
-      // Generate a short invite code
+      // Get the cached file ID (set when /sync/push was first called)
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const fileId      = await getOrFindDriveFileId(accessToken);
+      if (!fileId) return json({ error: 'Drive file not found — sync at least once first' }, corsHeaders, 400);
       const code = Array.from(crypto.getRandomValues(new Uint8Array(4)))
         .map(b => b.toString(36).padStart(2,'0')).join('').toUpperCase().slice(0,6);
-      await kv.set(['invite', code], JSON.stringify({ fileId }), { expireIn: 86400000 }); // 24hr
+      await kv.set(['invite', code], JSON.stringify({ fileId }), { expireIn: 86400000 });
       return json({ code }, corsHeaders);
     } catch(err) {
       return json({ error: err.message }, corsHeaders, 500);
@@ -438,6 +435,74 @@ async function handleRequest(request) {
       return json({ modifiedTime: data.modifiedTime }, corsHeaders);
     } catch(err) {
       return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Sync: pull current Drive data (frontend calls this instead of Drive directly) ──
+  if (url.pathname === '/sync/pull' && request.method === 'GET') {
+    try {
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ error: 'Not connected to Drive' }, corsHeaders, 503);
+      const accessToken  = await getGoogleAccessToken(refreshToken);
+      const fileId       = await getOrFindDriveFileId(accessToken);
+      if (!fileId) return json({ error: 'Drive file not found' }, corsHeaders, 404);
+      const res  = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (!res.ok) return json({ error: `Drive read failed: ${res.status}` }, corsHeaders, res.status);
+      const data = await res.json();
+      return json(data, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Sync: push data to Drive ──────────────────────────────
+  if (url.pathname === '/sync/push' && request.method === 'POST') {
+    try {
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ error: 'Not connected to Drive' }, corsHeaders, 503);
+      const accessToken  = await getGoogleAccessToken(refreshToken);
+      let   fileId       = await getOrFindDriveFileId(accessToken);
+      const payload      = await request.text();
+
+      if (!fileId) {
+        // First sync — create the file
+        const meta = await fetch('https://www.googleapis.com/drive/v3/files', {
+          method:  'POST',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ name: 'stockroom_data.json', mimeType: 'application/json' }),
+        });
+        if (!meta.ok) throw new Error(`Drive create failed: ${meta.status}`);
+        fileId = (await meta.json()).id;
+        await KV.put('drive_file_id', fileId);
+      }
+
+      const res = await fetch(
+        `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+        { method: 'PATCH', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: payload }
+      );
+      if (!res.ok) throw new Error(`Drive write failed: ${res.status}`);
+      return json({ ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Sync: get Drive file modified time (for cloud-ahead check) ──
+  if (url.pathname === '/sync/modified' && request.method === 'GET') {
+    try {
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ modifiedTime: null }, corsHeaders);
+      const accessToken  = await getGoogleAccessToken(refreshToken);
+      const fileId       = await getOrFindDriveFileId(accessToken);
+      if (!fileId) return json({ modifiedTime: null }, corsHeaders);
+      const res  = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=modifiedTime`,
+        { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (!res.ok) return json({ modifiedTime: null }, corsHeaders);
+      const data = await res.json();
+      return json({ modifiedTime: data.modifiedTime }, corsHeaders);
+    } catch(err) {
+      return json({ modifiedTime: null }, corsHeaders);
     }
   }
 
@@ -539,6 +604,22 @@ async function cronCheck() {
   }
 }
 
+// ── Drive file ID cache ───────────────────────────────────
+// Avoids searching for stockroom_data.json on every sync.
+// Cached in KV — survives deployments.
+async function getOrFindDriveFileId(accessToken) {
+  const cached = await KV.get('drive_file_id');
+  if (cached) return cached;
+  const res  = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=name='stockroom_data.json'+and+trashed=false&fields=files(id)`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const data = await res.json();
+  const id   = data.files?.[0]?.id || null;
+  if (id) await KV.put('drive_file_id', id);
+  return id;
+}
+
 // ── Google Drive helpers ──────────────────────────────────
 async function getGoogleAccessToken(refreshToken) {
   const res = await fetch('https://oauth2.googleapis.com/token', {
@@ -558,13 +639,8 @@ async function getGoogleAccessToken(refreshToken) {
 
 async function getItemsFromDrive(refreshToken) {
   const accessToken = await getGoogleAccessToken(refreshToken);
-  const searchRes   = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=name='stockroom_data.json'+and+trashed=false&fields=files(id)`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
-  const searchData = await searchRes.json();
-  if (!searchData.files?.length) throw new Error('stockroom_data.json not found in Drive');
-  const fileId  = searchData.files[0].id;
+  const fileId      = await getOrFindDriveFileId(accessToken);
+  if (!fileId) throw new Error('stockroom_data.json not found in Drive');
   const fileRes = await fetch(
     `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
