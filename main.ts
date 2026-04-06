@@ -629,6 +629,24 @@ async function handleRequest(request) {
     }
   }
 
+  // ── Share: restore from Drive backup (re-seeds KV after a wipe) ──
+  if (url.pathname === '/share/restore' && request.method === 'POST') {
+    try {
+      const target = await request.json();
+      if (!target.code) return json({ error: 'Missing code' }, corsHeaders, 400);
+      const existing = await kv.get(['share', target.code.toUpperCase()]);
+      // Only restore if KV doesn't already have this code
+      if (!existing.value) {
+        const { code, ...data } = target;
+        await kv.set(['share', code.toUpperCase()], JSON.stringify(data));
+        console.log(`Restored share target ${code} from Drive backup`);
+      }
+      return json({ ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
   return new Response('Not found', { status: 404 });
 }
 
