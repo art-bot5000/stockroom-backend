@@ -265,6 +265,182 @@ async function handleRequest(request) {
     }
   }
 
+  // ── Presence: write this user's presence to KV ──────────
+  if (url.pathname === '/presence-update' && request.method === 'POST') {
+    try {
+      const body = await request.json();
+      const { userId, name, initials, colour, view, ts } = body;
+      if (!userId) return json({ error: 'Missing userId' }, corsHeaders, 400);
+      await kv.set(['presence', userId], JSON.stringify({ userId, name, initials, colour, view, ts }), { expireIn: 35000 });
+      return json({ ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Presence: SSE stream of all active users ─────────────
+  // Uses Deno KV Watch to push updates whenever any presence key changes.
+  if (url.pathname === '/presence-stream' && request.method === 'GET') {
+    const userId = url.searchParams.get('userId') || '';
+
+    const sseHeaders = {
+      ...corsHeaders,
+      'Content-Type':  'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection':    'keep-alive',
+      'X-Accel-Buffering': 'no',
+    };
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encode = (s) => new TextEncoder().encode(s);
+        let closed = false;
+
+        const sendUsers = async () => {
+          if (closed) return;
+          const entries = kv.list({ prefix: ['presence'] });
+          const users = [];
+          for await (const entry of entries) {
+            try { users.push(JSON.parse(entry.value)); } catch(e) {}
+          }
+          const payload = `data: ${JSON.stringify({ type: 'presence', users })}\n\n`;
+          try { controller.enqueue(encode(payload)); } catch(e) { closed = true; }
+        };
+
+        // Send current presence immediately on connect
+        await sendUsers();
+
+        // Heartbeat every 20s to keep connection alive through proxies
+        const heartbeat = setInterval(() => {
+          if (closed) { clearInterval(heartbeat); return; }
+          try { controller.enqueue(encode(': heartbeat\n\n')); } catch(e) { closed = true; }
+        }, 20000);
+
+        // Poll for presence changes every 5s
+        // (KV Watch on a prefix requires iterating — polling is simpler and reliable on Deploy)
+        const pollInterval = setInterval(async () => {
+          if (closed) { clearInterval(pollInterval); clearInterval(heartbeat); return; }
+          await sendUsers();
+        }, 5000);
+      },
+      cancel() {
+        // Client disconnected — remove their presence entry
+        kv.delete(['presence', userId]).catch(() => {});
+      }
+    });
+
+    return new Response(stream, { headers: sseHeaders });
+  }
+
+  // ── Household: owner creates an invite code ─────────────
+  // Stores the owner's driveFileId under a short invite code (6 chars, 24hr TTL).
+  // The partner pastes this code to join — no credentials are ever shared.
+  if (url.pathname === '/invite/create' && request.method === 'POST') {
+    try {
+      const body       = await request.json();
+      const { fileId } = body;
+      if (!fileId) return json({ error: 'Missing fileId' }, corsHeaders, 400);
+      // Verify owner has a refresh token stored
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ error: 'No Drive connection on server — sync first' }, corsHeaders, 400);
+      // Generate a short invite code
+      const code = Array.from(crypto.getRandomValues(new Uint8Array(4)))
+        .map(b => b.toString(36).padStart(2,'0')).join('').toUpperCase().slice(0,6);
+      await kv.set(['invite', code], JSON.stringify({ fileId }), { expireIn: 86400000 }); // 24hr
+      return json({ code }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Household: partner joins via invite code ──────────────
+  // Resolves the code to a fileId and returns it. The partner's app
+  // then uses the proxy endpoints to read/write that file via the owner's token.
+  if (url.pathname === '/invite/join' && request.method === 'POST') {
+    try {
+      const body     = await request.json();
+      const { code } = body;
+      if (!code) return json({ error: 'Missing code' }, corsHeaders, 400);
+      const raw = await KV.get('invite:' + code.toUpperCase());
+      // Try both key formats
+      const entryRaw = raw || await (async () => {
+        const r = await kv.get(['invite', code.toUpperCase()]);
+        return r.value ?? null;
+      })();
+      if (!entryRaw) return json({ error: 'Invalid or expired invite code' }, corsHeaders, 404);
+      const { fileId } = JSON.parse(entryRaw);
+      // Don't delete — allow multiple devices to join with same code within 24hr
+      return json({ fileId, ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Household: proxy Drive file read (uses owner's token) ─
+  // Partner devices call this instead of Drive directly.
+  if (url.pathname === '/drive/read' && request.method === 'GET') {
+    try {
+      const fileId = url.searchParams.get('fileId');
+      if (!fileId) return json({ error: 'Missing fileId' }, corsHeaders, 400);
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ error: 'No owner Drive token on server' }, corsHeaders, 503);
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!res.ok) return json({ error: `Drive read failed: ${res.status}` }, corsHeaders, res.status);
+      const data = await res.json();
+      return json(data, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Household: proxy Drive file write (uses owner's token) ─
+  if (url.pathname === '/drive/write' && request.method === 'POST') {
+    try {
+      const fileId  = url.searchParams.get('fileId');
+      if (!fileId) return json({ error: 'Missing fileId' }, corsHeaders, 400);
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ error: 'No owner Drive token on server' }, corsHeaders, 503);
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const payload = await request.text();
+      const res = await fetch(
+        `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+        {
+          method:  'PATCH',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body:    payload,
+        }
+      );
+      if (!res.ok) return json({ error: `Drive write failed: ${res.status}` }, corsHeaders, res.status);
+      return json({ ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Household: get modified time (for checkCloudAhead) ───
+  if (url.pathname === '/drive/modified' && request.method === 'GET') {
+    try {
+      const fileId = url.searchParams.get('fileId');
+      if (!fileId) return json({ error: 'Missing fileId' }, corsHeaders, 400);
+      const refreshToken = await KV.get('drive_refresh_token');
+      if (!refreshToken) return json({ error: 'No owner Drive token' }, corsHeaders, 503);
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?fields=modifiedTime`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!res.ok) return json({ error: `Drive stat failed: ${res.status}` }, corsHeaders, res.status);
+      const data = await res.json();
+      return json({ modifiedTime: data.modifiedTime }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
   return new Response('Not found', { status: 404 });
 }
 
@@ -431,20 +607,29 @@ async function getItemsFromDropbox(refreshToken) {
 }
 
 // ── Stock calculation ─────────────────────────────────────
+// Must match frontend calcStock() exactly so cron sees same daysLeft as the UI.
 function computeDaysLeft(itemsArr) {
   const now = Date.now();
   return itemsArr
     .filter(item => item.logs?.length)
     .map(item => {
-      // Only count delivered logs — same logic as the frontend calcStock()
+      // Only count delivered logs — skip pending deliveries
       const deliveredLogs = (item.logs || []).filter(l => !l.pendingDelivery);
       if (!deliveredLogs.length) return null;
-      const last      = deliveredLogs[deliveredLogs.length - 1];
-      const refDate   = item.startedUsing || last.date;
-      const daysSince = (now - new Date(refDate + 'T12:00:00').getTime()) / 86400000;
-      const totalDays = (item.months || 1) * 30.5 * (last.qty || 1);
-      const daysLeft  = Math.round(Math.max(0, totalDays - daysSince));
-      if (daysLeft > 30) return null;
+
+      // Sum total qty across all delivered logs (same as frontend calcStock)
+      const totalQty  = deliveredLogs.reduce((s, l) => s + (parseFloat(l.qty) || 1), 0);
+      const totalDays = (item.months || 1) * 30.5 * totalQty;
+
+      // Reference date: startedUsing if set, otherwise earliest log date
+      const sortedLogs = [...deliveredLogs].sort((a, b) => new Date(a.date) - new Date(b.date));
+      const refDate    = item.startedUsing || sortedLogs[0].date;
+      const daysSince  = (now - new Date(refDate + 'T12:00:00').getTime()) / 86400000;
+      const daysLeft   = Math.round(Math.max(0, totalDays - daysSince));
+
+      // Include items within 45 days (raised from 30 to avoid edge cases)
+      if (daysLeft > 45) return null;
+
       const prices = deliveredLogs
         .map(l => parseFloat(String(l.price || '').replace(/[^0-9.]/g, '')))
         .filter(v => !isNaN(v) && v > 0);
