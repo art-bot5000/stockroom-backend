@@ -215,15 +215,17 @@ async function handleRequest(request) {
   if (url.pathname === '/set-schedule' && request.method === 'POST') {
     try {
       const body = await request.json();
-      const { email, startDate, startTime, intervalDays, urgent = [], upcoming = [] } = body;
-      if (!email || !startDate) {
-        return json({ error: 'Missing email or startDate' }, corsHeaders, 400);
-      }
-      await KV.put('user_email', email);
-      await KV.put('schedule', JSON.stringify({ startDate, startTime: startTime || '09:00', intervalDays: intervalDays ?? 30 }));
-      if (urgent.length || upcoming.length) {
-        await KV.put('user_items', JSON.stringify({ urgent, upcoming }));
-      }
+      const { email, startDate, startTime, intervalDays, urgent = [], upcoming = [], household = null } = body;
+      if (!email || !startDate) return json({ error: 'Missing email or startDate' }, corsHeaders, 400);
+      const hSuffix    = household && household !== 'default' ? `:${household}` : '';
+      const emailKey   = `user_email${hSuffix}`;
+      const schedKey   = `schedule${hSuffix}`;
+      const itemsKey   = `user_items${hSuffix}`;
+      await KV.put(emailKey, email);
+      // Always store default email too for cron fallback
+      if (hSuffix) await KV.put('user_email', email);
+      await KV.put(schedKey, JSON.stringify({ startDate, startTime: startTime || '09:00', intervalDays: intervalDays ?? 30 }));
+      if (urgent.length || upcoming.length) await KV.put(itemsKey, JSON.stringify({ urgent, upcoming }));
       return json({ ok: true }, corsHeaders);
     } catch (err) {
       return json({ error: err.message }, corsHeaders, 500);
@@ -232,16 +234,26 @@ async function handleRequest(request) {
 
   // ── Reset last sent ─────────────────────────────────────
   if (url.pathname === '/reset-schedule' && request.method === 'POST') {
-    await KV.delete('last_sent');
+    try {
+      const body      = await request.json().catch(() => ({}));
+      const household = body.household || null;
+      const key       = household && household !== 'default' ? `last_sent:${household}` : 'last_sent';
+      await KV.delete(key);
+    } catch(e) { await KV.delete('last_sent'); }
     return json({ ok: true }, corsHeaders);
   }
 
   // ── Unsubscribe ─────────────────────────────────────────
   if (url.pathname === '/unsubscribe' && request.method === 'POST') {
-    await KV.delete('schedule');
-    await KV.delete('last_sent');
-    await KV.delete('user_email');
-    await KV.delete('user_items');
+    try {
+      const body      = await request.json().catch(() => ({}));
+      const household = body.household || null;
+      const sfx       = household && household !== 'default' ? `:${household}` : '';
+      await KV.delete(`schedule${sfx}`);
+      await KV.delete(`last_sent${sfx}`);
+      await KV.delete(`user_email${sfx}`);
+      await KV.delete(`user_items${sfx}`);
+    } catch(e) {}
     return json({ ok: true }, corsHeaders);
   }
 
@@ -438,19 +450,19 @@ async function handleRequest(request) {
     }
   }
 
-  // ── Sync: pull current Drive data (frontend calls this instead of Drive directly) ──
+  // ── Sync: pull current Drive data ────────────────────────
   if (url.pathname === '/sync/pull' && request.method === 'GET') {
     try {
       const refreshToken = await KV.get('drive_refresh_token');
       if (!refreshToken) return json({ error: 'Not connected to Drive' }, corsHeaders, 503);
-      const accessToken  = await getGoogleAccessToken(refreshToken);
-      const fileId       = await getOrFindDriveFileId(accessToken);
+      const household   = url.searchParams.get('household') || null;
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const fileId      = await getOrFindDriveFileId(accessToken, household);
       if (!fileId) return json({ error: 'Drive file not found' }, corsHeaders, 404);
-      const res  = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
         { headers: { Authorization: `Bearer ${accessToken}` } });
       if (!res.ok) return json({ error: `Drive read failed: ${res.status}` }, corsHeaders, res.status);
-      const data = await res.json();
-      return json(data, corsHeaders);
+      return json(await res.json(), corsHeaders);
     } catch(err) {
       return json({ error: err.message }, corsHeaders, 500);
     }
@@ -461,20 +473,22 @@ async function handleRequest(request) {
     try {
       const refreshToken = await KV.get('drive_refresh_token');
       if (!refreshToken) return json({ error: 'Not connected to Drive' }, corsHeaders, 503);
-      const accessToken  = await getGoogleAccessToken(refreshToken);
-      let   fileId       = await getOrFindDriveFileId(accessToken);
-      const payload      = await request.text();
+      const household   = url.searchParams.get('household') || null;
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const payload     = await request.text();
+      let   fileId      = await getOrFindDriveFileId(accessToken, household);
 
       if (!fileId) {
-        // First sync — create the file
-        const meta = await fetch('https://www.googleapis.com/drive/v3/files', {
+        // First sync for this household — create the file
+        const fname = householdFileName(household);
+        const meta  = await fetch('https://www.googleapis.com/drive/v3/files', {
           method:  'POST',
           headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ name: 'stockroom_data.json', mimeType: 'application/json' }),
+          body:    JSON.stringify({ name: fname, mimeType: 'application/json' }),
         });
         if (!meta.ok) throw new Error(`Drive create failed: ${meta.status}`);
         fileId = (await meta.json()).id;
-        await KV.put('drive_file_id', fileId);
+        await KV.put(householdFileKey(household), fileId);
       }
 
       const res = await fetch(
@@ -488,19 +502,19 @@ async function handleRequest(request) {
     }
   }
 
-  // ── Sync: get Drive file modified time (for cloud-ahead check) ──
+  // ── Sync: get Drive file modified time ────────────────────
   if (url.pathname === '/sync/modified' && request.method === 'GET') {
     try {
       const refreshToken = await KV.get('drive_refresh_token');
       if (!refreshToken) return json({ modifiedTime: null }, corsHeaders);
-      const accessToken  = await getGoogleAccessToken(refreshToken);
-      const fileId       = await getOrFindDriveFileId(accessToken);
+      const household   = url.searchParams.get('household') || null;
+      const accessToken = await getGoogleAccessToken(refreshToken);
+      const fileId      = await getOrFindDriveFileId(accessToken, household);
       if (!fileId) return json({ modifiedTime: null }, corsHeaders);
-      const res  = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=modifiedTime`,
+      const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=modifiedTime`,
         { headers: { Authorization: `Bearer ${accessToken}` } });
       if (!res.ok) return json({ modifiedTime: null }, corsHeaders);
-      const data = await res.json();
-      return json({ modifiedTime: data.modifiedTime }, corsHeaders);
+      return json({ modifiedTime: (await res.json()).modifiedTime }, corsHeaders);
     } catch(err) {
       return json({ modifiedTime: null }, corsHeaders);
     }
@@ -510,21 +524,48 @@ async function handleRequest(request) {
 }
 
 // ── Cron logic ────────────────────────────────────────────
+// Runs per household — each has its own schedule and email settings.
+// Schedule keys: 'schedule' (default), 'schedule:profileKey' (others)
+// Last-sent keys: 'last_sent', 'last_sent:profileKey'
 async function cronCheck() {
-  try {
-    const email      = await KV.get('user_email');
-    const scheduleRaw = await KV.get('schedule');
-    const lastSentAt  = await KV.get('last_sent');
+  const driveRefresh   = await KV.get('drive_refresh_token');
+  const dropboxRefresh = await KV.get('dropbox_refresh_token');
 
-    if (!email || !scheduleRaw) { console.log('Cron: no schedule configured'); return; }
+  // Collect all household IDs from KV (schedule keys tell us which exist)
+  const households = ['default'];
+  try {
+    const entries = kv.list({ prefix: ['schedule:'] });
+    for await (const entry of entries) {
+      const key = entry.key[1]; // e.g. 'profile_1234567890'
+      if (key && !households.includes(key)) households.push(String(key));
+    }
+  } catch(e) {}
+
+  for (const household of households) {
+    await cronCheckHousehold(household, driveRefresh, dropboxRefresh);
+  }
+}
+
+async function cronCheckHousehold(household, driveRefresh, dropboxRefresh) {
+  try {
+    const schedKey    = household === 'default' ? 'schedule'  : `schedule:${household}`;
+    const lastSentKey = household === 'default' ? 'last_sent' : `last_sent:${household}`;
+    const emailKey    = household === 'default' ? 'user_email': `user_email:${household}`;
+
+    const email       = await KV.get(emailKey) || await KV.get('user_email'); // fall back to default email
+    const scheduleRaw = await KV.get(schedKey);
+    const lastSentAt  = await KV.get(lastSentKey);
+
+    if (!email || !scheduleRaw) {
+      if (household === 'default') console.log('Cron: no schedule configured for default household');
+      return;
+    }
 
     const { startDate, startTime, intervalDays } = JSON.parse(scheduleRaw);
-    const now      = new Date();
+    const now = new Date();
 
-    // Parse startDate+startTime as Europe/London time
     function toUKDate(dateStr, timeStr) {
-      // Build a temp date to measure the UK offset at that moment
-      const probe = new Date(`${dateStr}T${timeStr || '09:00'}:00Z`); // treat as UTC first
+      const probe = new Date(`${dateStr}T${timeStr || '09:00'}:00Z`);
       const ukParts = new Intl.DateTimeFormat('en-GB', {
         timeZone: 'Europe/London',
         year: 'numeric', month: '2-digit', day: '2-digit',
@@ -532,12 +573,9 @@ async function cronCheck() {
         hour12: false,
       }).formatToParts(probe);
       const get = (type) => parseInt(ukParts.find(p => p.type === type)?.value || '0');
-      const ukDate = new Date(Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')));
-      // Offset = difference between UTC representation and UK representation
+      const ukDate  = new Date(Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')));
       const offsetMs = ukDate.getTime() - probe.getTime();
-      // Target: dateStr + timeStr in UK local time → UTC
-      const localMs = new Date(`${dateStr}T${timeStr || '09:00'}:00Z`).getTime();
-      return new Date(localMs - offsetMs);
+      return new Date(new Date(`${dateStr}T${timeStr || '09:00'}:00Z`).getTime() - offsetMs);
     }
 
     const nextSend = !lastSentAt
@@ -545,40 +583,36 @@ async function cronCheck() {
       : new Date(new Date(lastSentAt).getTime() + intervalDays * 86400000);
 
     if (now < nextSend) {
-      console.log(`Cron: next send in ${Math.round((nextSend.getTime() - now.getTime()) / 60000)} mins`);
+      console.log(`Cron [${household}]: next send in ${Math.round((nextSend - now) / 60000)} mins`);
       return;
     }
 
     let urgentItems = [], upcomingItems = [], source = null;
 
-    // Try Google Drive
-    const driveRefresh = await KV.get('drive_refresh_token');
+    // Try Drive (per-household file)
     if (driveRefresh) {
       try {
-        const fresh = await getItemsFromDrive(driveRefresh);
+        const fresh = await getItemsFromDrive(driveRefresh, household === 'default' ? null : household);
         urgentItems   = fresh.filter(i => i.daysLeft <= 7);
-        upcomingItems = fresh.filter(i => i.daysLeft > 7 && i.daysLeft <= 30);
+        upcomingItems = fresh.filter(i => i.daysLeft > 7 && i.daysLeft <= 45);
         source = 'Drive';
-        console.log(`Cron: ${fresh.length} items from Drive`);
-      } catch (err) { console.warn('Cron: Drive failed:', err.message); }
+        console.log(`Cron [${household}]: ${fresh.length} items from Drive`);
+      } catch (err) { console.warn(`Cron [${household}]: Drive failed:`, err.message); }
     }
 
-    // Try Dropbox
-    if (!source) {
-      const dropboxRefresh = await KV.get('dropbox_refresh_token');
-      if (dropboxRefresh) {
-        try {
-          const fresh = await getItemsFromDropbox(dropboxRefresh);
-          urgentItems   = fresh.filter(i => i.daysLeft <= 7);
-          upcomingItems = fresh.filter(i => i.daysLeft > 7 && i.daysLeft <= 30);
-          source = 'Dropbox';
-          console.log(`Cron: ${fresh.length} items from Dropbox`);
-        } catch (err) { console.warn('Cron: Dropbox failed:', err.message); }
-      }
+    // Try Dropbox (only for default household — Dropbox doesn't have per-file support yet)
+    if (!source && household === 'default' && dropboxRefresh) {
+      try {
+        const fresh = await getItemsFromDropbox(dropboxRefresh);
+        urgentItems   = fresh.filter(i => i.daysLeft <= 7);
+        upcomingItems = fresh.filter(i => i.daysLeft > 7 && i.daysLeft <= 45);
+        source = 'Dropbox';
+        console.log(`Cron [${household}]: ${fresh.length} items from Dropbox`);
+      } catch (err) { console.warn(`Cron [${household}]: Dropbox failed:`, err.message); }
     }
 
-    // KV snapshot fallback
-    if (!source) {
+    // KV snapshot fallback (default only)
+    if (!source && household === 'default') {
       const itemsRaw = await KV.get('user_items');
       if (!itemsRaw) { console.log('Cron: no items available'); return; }
       const { urgent = [], upcoming = [] } = JSON.parse(itemsRaw);
@@ -586,37 +620,54 @@ async function cronCheck() {
       source = 'KV snapshot';
     }
 
+    if (!source) return;
+
     if (!urgentItems.length && !upcomingItems.length) {
-      await KV.put('last_sent', now.toISOString());
-      console.log('Cron: nothing due, marking sent');
+      await KV.put(lastSentKey, now.toISOString());
+      console.log(`Cron [${household}]: nothing due, marking sent`);
       return;
     }
 
-    const result = await sendEmail(email, urgentItems, upcomingItems);
+    const result = await sendEmail(email, urgentItems, upcomingItems, household);
     if (result.ok) {
-      await KV.put('last_sent', now.toISOString());
-      console.log(`Cron: sent to ${email} (${source})`);
+      await KV.put(lastSentKey, now.toISOString());
+      console.log(`Cron [${household}]: sent to ${email} (${source})`);
     } else {
-      console.error('Cron send failed:', result.error);
+      console.error(`Cron [${household}]: send failed:`, result.error);
     }
   } catch (err) {
-    console.error('Cron error:', err.message);
+    console.error(`Cron [${household}] error:`, err.message);
   }
 }
 
 // ── Drive file ID cache ───────────────────────────────────
 // Avoids searching for stockroom_data.json on every sync.
 // Cached in KV — survives deployments.
-async function getOrFindDriveFileId(accessToken) {
-  const cached = await KV.get('drive_file_id');
+// ── Per-household file ID cache ───────────────────────────
+// Default household uses 'drive_file_id' (backwards compatible).
+// Additional households use 'drive_file_id:profileKey' and their own filename.
+function householdFileKey(household) {
+  return household && household !== 'default' ? `drive_file_id:${household}` : 'drive_file_id';
+}
+
+function householdFileName(household) {
+  return household && household !== 'default'
+    ? `stockroom_${household.replace(/[^a-z0-9]/gi, '_')}.json`
+    : 'stockroom_data.json';
+}
+
+async function getOrFindDriveFileId(accessToken, household = null) {
+  const kvKey   = householdFileKey(household);
+  const cached  = await KV.get(kvKey);
   if (cached) return cached;
-  const res  = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=name='stockroom_data.json'+and+trashed=false&fields=files(id)`,
+  const fname = householdFileName(household);
+  const res   = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=name='${fname}'+and+trashed=false&fields=files(id)`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await res.json();
   const id   = data.files?.[0]?.id || null;
-  if (id) await KV.put('drive_file_id', id);
+  if (id) await KV.put(kvKey, id);
   return id;
 }
 
@@ -637,10 +688,10 @@ async function getGoogleAccessToken(refreshToken) {
   return data.access_token;
 }
 
-async function getItemsFromDrive(refreshToken) {
+async function getItemsFromDrive(refreshToken, household = null) {
   const accessToken = await getGoogleAccessToken(refreshToken);
-  const fileId      = await getOrFindDriveFileId(accessToken);
-  if (!fileId) throw new Error('stockroom_data.json not found in Drive');
+  const fileId      = await getOrFindDriveFileId(accessToken, household);
+  if (!fileId) throw new Error(`stockroom file not found in Drive for household: ${household || 'default'}`);
   const fileRes = await fetch(
     `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -723,9 +774,10 @@ function computeDaysLeft(itemsArr) {
 }
 
 // ── Email ─────────────────────────────────────────────────
-async function sendEmail(to, urgentItems, upcomingItems) {
-  const appUrl     = env.APP_URL;
-  const totalItems = urgentItems.length + upcomingItems.length;
+async function sendEmail(to, urgentItems, upcomingItems, household = null) {
+  const appUrl      = env.APP_URL;
+  const totalItems  = urgentItems.length + upcomingItems.length;
+  const householdLabel = household && household !== 'default' ? ` · ${household.replace('profile_', 'Household ')}` : '';
 
   const makeRows = items => items.map(item => {
     const priceCell = item.lastPrice
@@ -805,7 +857,7 @@ async function sendEmail(to, urgentItems, upcomingItems) {
     body: JSON.stringify({
       from:    env.FROM_EMAIL,
       to:      [to],
-      subject: `📦 STOCKROOM — ${urgentItems.length ? `${urgentItems.length} urgent, ` : ''}${totalItems} item${totalItems !== 1 ? 's' : ''} running low`,
+      subject: `📦 STOCKROOM${householdLabel} — ${urgentItems.length ? `${urgentItems.length} urgent, ` : ''}${totalItems} item${totalItems !== 1 ? 's' : ''} running low`,
       html,
     }),
   });
