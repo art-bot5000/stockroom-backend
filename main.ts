@@ -456,6 +456,20 @@ async function handleRequest(request) {
       const refreshToken = await KV.get('drive_refresh_token');
       if (!refreshToken) return json({ error: 'Not connected to Drive' }, corsHeaders, 503);
       const household   = url.searchParams.get('household') || null;
+      const shareCode   = url.searchParams.get('share') || null;
+
+      // Validate share code if present
+      if (shareCode) {
+        const r = await kv.get(['share', shareCode.toUpperCase()]);
+        if (!r.value) return json({ error: 'Invalid share code' }, corsHeaders, 403);
+        const target = JSON.parse(r.value);
+        const hKey   = household || 'default';
+        const hPerms = target.households?.[hKey];
+        if (!hPerms || hPerms.stockroom === 'none') {
+          return json({ error: 'No access to this household' }, corsHeaders, 403);
+        }
+      }
+
       const accessToken = await getGoogleAccessToken(refreshToken);
       const fileId      = await getOrFindDriveFileId(accessToken, household);
       if (!fileId) return json({ error: 'Drive file not found' }, corsHeaders, 404);
