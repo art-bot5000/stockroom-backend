@@ -474,12 +474,26 @@ async function handleRequest(request) {
       const refreshToken = await KV.get('drive_refresh_token');
       if (!refreshToken) return json({ error: 'Not connected to Drive' }, corsHeaders, 503);
       const household   = url.searchParams.get('household') || null;
+      const shareCode   = url.searchParams.get('share') || null;
+
+      // Validate write permission if this is a shared user
+      if (shareCode) {
+        const r = await kv.get(['share', shareCode.toUpperCase()]);
+        if (!r.value) return json({ error: 'Invalid share code' }, corsHeaders, 403);
+        const target = JSON.parse(r.value);
+        const hKey   = household || 'default';
+        const hPerms = target.households?.[hKey];
+        if (!hPerms) return json({ error: 'No access to this household' }, corsHeaders, 403);
+        // Check at least one section has write access
+        const hasWrite = Object.values(hPerms).some(v => v === 'rw');
+        if (!hasWrite) return json({ error: 'Read-only access — cannot write' }, corsHeaders, 403);
+      }
+
       const accessToken = await getGoogleAccessToken(refreshToken);
       const payload     = await request.text();
       let   fileId      = await getOrFindDriveFileId(accessToken, household);
 
       if (!fileId) {
-        // First sync for this household — create the file
         const fname = householdFileName(household);
         const meta  = await fetch('https://www.googleapis.com/drive/v3/files', {
           method:  'POST',
@@ -517,6 +531,87 @@ async function handleRequest(request) {
       return json({ modifiedTime: (await res.json()).modifiedTime }, corsHeaders);
     } catch(err) {
       return json({ modifiedTime: null }, corsHeaders);
+    }
+  }
+
+  // ── Share: owner creates a share target ──────────────────
+  // Stores a permission set under a short code. The link is:
+  // https://art-bot5000.github.io/stockroom/?join=CODE
+  if (url.pathname === '/share/create' && request.method === 'POST') {
+    try {
+      const body = await request.json();
+      const { name, type, ownerName, households } = body;
+      // type: 'family' | 'cleaner' | 'guest'
+      // households: { [profileKey]: { stockroom, groceries, reminders, savings, report } }
+      // each section: 'rw' | 'r' | 'none'
+      if (!name || !households) return json({ error: 'Missing required fields' }, corsHeaders, 400);
+      const code = Array.from(crypto.getRandomValues(new Uint8Array(4)))
+        .map(b => b.toString(36).padStart(2,'0')).join('').toUpperCase().slice(0,6);
+      const target = { name, type: type || 'guest', ownerName: ownerName || 'Owner', households, createdAt: new Date().toISOString() };
+      await kv.set(['share', code], JSON.stringify(target)); // no TTL — permanent until deleted
+      return json({ code, link: `https://art-bot5000.github.io/stockroom/?join=${code}` }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Share: list all share targets (owner only) ────────────
+  if (url.pathname === '/share/list' && request.method === 'GET') {
+    try {
+      const targets = [];
+      const entries = kv.list({ prefix: ['share'] });
+      for await (const entry of entries) {
+        try {
+          const data = JSON.parse(entry.value);
+          targets.push({ code: entry.key[1], ...data });
+        } catch(e) {}
+      }
+      return json({ targets }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Share: delete a share target ─────────────────────────
+  if (url.pathname === '/share/delete' && request.method === 'POST') {
+    try {
+      const { code } = await request.json();
+      if (!code) return json({ error: 'Missing code' }, corsHeaders, 400);
+      await kv.delete(['share', code.toUpperCase()]);
+      return json({ ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Share: update a share target's permissions ────────────
+  if (url.pathname === '/share/update' && request.method === 'POST') {
+    try {
+      const body = await request.json();
+      const { code, name, type, households } = body;
+      if (!code) return json({ error: 'Missing code' }, corsHeaders, 400);
+      const raw = await (async () => { const r = await kv.get(['share', code.toUpperCase()]); return r.value ?? null; })();
+      if (!raw) return json({ error: 'Share target not found' }, corsHeaders, 404);
+      const existing = JSON.parse(raw);
+      const updated  = { ...existing, ...(name && { name }), ...(type && { type }), ...(households && { households }) };
+      await kv.set(['share', code.toUpperCase()], JSON.stringify(updated));
+      return json({ ok: true }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
+    }
+  }
+
+  // ── Share: join — resolve code to permission set ──────────
+  if (url.pathname === '/share/join' && request.method === 'POST') {
+    try {
+      const { code } = await request.json();
+      if (!code) return json({ error: 'Missing code' }, corsHeaders, 400);
+      const r = await kv.get(['share', code.toUpperCase()]);
+      if (!r.value) return json({ error: 'Invalid invite link — ask the owner to check it' }, corsHeaders, 404);
+      const target = JSON.parse(r.value);
+      return json({ ok: true, ...target, code: code.toUpperCase() }, corsHeaders);
+    } catch(err) {
+      return json({ error: err.message }, corsHeaders, 500);
     }
   }
 
